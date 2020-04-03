@@ -201,6 +201,7 @@ namespace aux {
 	constexpr listen_socket_flags_t listen_socket_t::accept_incoming;
 	constexpr listen_socket_flags_t listen_socket_t::local_network;
 	constexpr listen_socket_flags_t listen_socket_t::was_expanded;
+	constexpr listen_socket_flags_t listen_socket_t::proxy;
 
 	constexpr ip_source_t session_interface::source_dht;
 	constexpr ip_source_t session_interface::source_peer;
@@ -321,6 +322,9 @@ namespace aux {
 
 	bool listen_socket_t::can_route(address const& addr) const
 	{
+		// if this is a proxy, we assume it can reach everything
+		if (flags & proxy) return true;
+
 		if (is_v4(local_endpoint) != addr.is_v4()) return false;
 
 		if (local_endpoint.address().is_v6()
@@ -1343,7 +1347,11 @@ namespace {
 #endif
 			(pack.has_val(settings_pack::listen_interfaces)
 				&& pack.get_str(settings_pack::listen_interfaces)
-					!= m_settings.get_str(settings_pack::listen_interfaces));
+					!= m_settings.get_str(settings_pack::listen_interfaces))
+			|| (pack.has_val(settings_pack::proxy_type)
+				&& pack.get_int(settings_pack::proxy_type)
+					!= m_settings.get_int(settings_pack::proxy_type))
+			;
 
 #ifndef TORRENT_DISABLE_LOGGING
 		session_log("applying settings pack, reopen_listen_port=%s"
@@ -1820,64 +1828,74 @@ namespace {
 		// of a new socket failing to bind due to a conflict with a stale socket
 		std::vector<listen_endpoint_t> eps;
 
-		listen_socket_flags_t const flags
-			= (m_settings.get_int(settings_pack::proxy_type) != settings_pack::none)
-			? listen_socket_flags_t{}
+		if (m_settings.get_int(settings_pack::proxy_type) != settings_pack::none)
+		{
+			listen_endpoint_t ep(address_v4::any(), random(63000) + 2000, {}
+				, transport::plaintext, listen_socket_t::proxy);
+			eps.emplace_back(ep);
+		}
+		else
+		{
+
+			listen_socket_flags_t const flags
+				= (m_settings.get_int(settings_pack::proxy_type) != settings_pack::none)
+				? listen_socket_flags_t{}
 			: listen_socket_t::accept_incoming;
 
-		std::vector<ip_interface> const ifs = enum_net_interfaces(m_io_service, ec);
-		if (ec && m_alerts.should_post<listen_failed_alert>())
-		{
-			m_alerts.emplace_alert<listen_failed_alert>(""
-				, operation_t::enum_if, ec, socket_type_t::tcp);
-		}
-		auto const routes = enum_routes(m_io_service, ec);
-		if (ec && m_alerts.should_post<listen_failed_alert>())
-		{
-			m_alerts.emplace_alert<listen_failed_alert>(""
-				, operation_t::enum_route, ec, socket_type_t::tcp);
-		}
-
-		// expand device names and populate eps
-		for (auto const& iface : m_listen_interfaces)
-		{
-#ifndef TORRENT_USE_OPENSSL
-			if (iface.ssl)
+			std::vector<ip_interface> const ifs = enum_net_interfaces(m_io_service, ec);
+			if (ec && m_alerts.should_post<listen_failed_alert>())
 			{
-#ifndef TORRENT_DISABLE_LOGGING
-				session_log("attempted to listen ssl with no library support on device: \"%s\""
-					, iface.device.c_str());
-#endif
-				if (m_alerts.should_post<listen_failed_alert>())
-				{
-					m_alerts.emplace_alert<listen_failed_alert>(iface.device
-						, operation_t::sock_open
-						, boost::asio::error::operation_not_supported
-						, socket_type_t::tcp_ssl);
-				}
-				continue;
+				m_alerts.emplace_alert<listen_failed_alert>(""
+					, operation_t::enum_if, ec, socket_type_t::tcp);
 			}
+			auto const routes = enum_routes(m_io_service, ec);
+			if (ec && m_alerts.should_post<listen_failed_alert>())
+			{
+				m_alerts.emplace_alert<listen_failed_alert>(""
+					, operation_t::enum_route, ec, socket_type_t::tcp);
+			}
+
+			// expand device names and populate eps
+			for (auto const& iface : m_listen_interfaces)
+			{
+#ifndef TORRENT_USE_OPENSSL
+				if (iface.ssl)
+				{
+#ifndef TORRENT_DISABLE_LOGGING
+					session_log("attempted to listen ssl with no library support on device: \"%s\""
+						, iface.device.c_str());
+#endif
+					if (m_alerts.should_post<listen_failed_alert>())
+					{
+						m_alerts.emplace_alert<listen_failed_alert>(iface.device
+							, operation_t::sock_open
+							, boost::asio::error::operation_not_supported
+							, socket_type_t::tcp_ssl);
+					}
+					continue;
+				}
 #endif
 
-			// now we have a device to bind to. This device may actually just be an
-			// IP address or a device name. In case it's a device name, we want to
-			// (potentially) end up binding a socket for each IP address associated
-			// with that device.
-			interface_to_endpoints(iface, flags, ifs, eps);
-		}
+				// now we have a device to bind to. This device may actually just be an
+				// IP address or a device name. In case it's a device name, we want to
+				// (potentially) end up binding a socket for each IP address associated
+				// with that device.
+				interface_to_endpoints(iface, flags, ifs, eps);
+			}
 
-		// if no listen interfaces are specified, create sockets to use
-		// any interface
-		if (eps.empty())
-		{
-			eps.emplace_back(address_v4(), 0, "", transport::plaintext
-				, listen_socket_flags_t{});
-			eps.emplace_back(address_v6(), 0, "", transport::plaintext
-				, listen_socket_flags_t{});
-		}
+			// if no listen interfaces are specified, create sockets to use
+			// any interface
+			if (eps.empty())
+			{
+				eps.emplace_back(address_v4(), 0, "", transport::plaintext
+					, listen_socket_flags_t{});
+				eps.emplace_back(address_v6(), 0, "", transport::plaintext
+					, listen_socket_flags_t{});
+			}
 
-		expand_unspecified_address(ifs, routes, eps);
-		expand_devices(ifs, eps);
+			expand_unspecified_address(ifs, routes, eps);
+			expand_devices(ifs, eps);
+		}
 
 		auto remove_iter = partition_listen_sockets(eps, m_listen_sockets);
 
